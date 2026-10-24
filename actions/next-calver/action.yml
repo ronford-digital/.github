@@ -10,7 +10,7 @@ inputs:
   legacy-prefixes:
     description: >
       Space-separated older tag prefixes whose versions must not be reused
-      (cut-over only), e.g. "v".
+      (cut-over only), e.g. "v". Use "<bare>" for un-prefixed tags like 2026.9.28.
     required: false
     default: ""
   prerelease:
@@ -48,14 +48,18 @@ runs:
         git fetch --tags --force --quiet origin
 
         read -r -a legacy <<< "$LEGACY_PREFIXES"
-        VERSION=$("${GITHUB_ACTION_PATH}/next-calver.sh" "$TAG_PREFIX" "${legacy[@]}")
+        for i in "${!legacy[@]}"; do
+          [[ "${legacy[$i]}" == "<bare>" ]] && legacy[$i]=""
+        done
+        VERSION=$("${GITHUB_ACTION_PATH}/next-calver.sh" "$TAG_PREFIX" ${legacy[@]+"${legacy[@]}"})
 
-        # Stable tags only (no -rc.N), newest by creation date -- never `| sort`,
+        # Stable tags only (no -rc.N), newest by creation date, ties (lightweight
+        # tags on one commit) broken by version order -- never a plain `| sort`,
         # unpadded CalVer does not sort lexically.
         PREVIOUS=$(
-          for p in "$TAG_PREFIX" "${legacy[@]}"; do
+          for p in "$TAG_PREFIX" ${legacy[@]+"${legacy[@]}"}; do
             git tag -l "${p}[0-9]*" --format='%(creatordate:unix) %(refname:short)'
-          done | grep -vE -- '-[a-z]+\.[0-9]+$' | sort -rn | head -1 | cut -d' ' -f2 || true
+          done | grep -vE -- '-[a-z]+\.[0-9]+$' | sort -k1,1nr -k2,2Vr | head -1 | cut -d' ' -f2 || true
         )
 
         echo "version=$VERSION" >> "$GITHUB_OUTPUT"
