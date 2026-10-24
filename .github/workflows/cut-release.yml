@@ -19,7 +19,7 @@
 #     ]
 #   }
 #
-# See IMAGE-TAGGING-AND-PROMOTION-STANDARD.md (devops-knpdts-argocd-manifests).
+# See devops-rddev-big-picture: 06 Deployment Standards.
 name: Cut release (reusable)
 
 on:

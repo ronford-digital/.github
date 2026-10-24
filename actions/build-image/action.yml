@@ -75,7 +75,7 @@ runs:
           [[ -z "$t" ]] && continue
           # RULE: no mutable tags. A manifest pinned to one cannot be rolled back.
           if [[ "$t" == "latest" || "$t" == *-latest ]]; then
-            echo "::error::Refusing to push mutable tag '$t' (see IMAGE-TAGGING-AND-PROMOTION-STANDARD.md, Part 6.5)"
+            echo "::error::Refusing to push mutable tag '$t' (see 06 Deployment Standards / 01 Image Tagging and Versioning)"
             exit 1
           fi
           [[ -z "$first" ]] && first="$t"

@@ -2,7 +2,7 @@
 # CalVer (YYYY.M.D, no zero-padding, matching RonfordDigital.SharedKernel's own
 # scheme) for a given git tag prefix. A same-day second release gets a .N suffix.
 # Promoted from ronford-signal/scripts/next-calver.sh -- the org-wide standard is
-# IMAGE-TAGGING-AND-PROMOTION-STANDARD.md (devops-knpdts-argocd-manifests).
+# devops-rddev-big-picture: 06 Deployment Standards.
 #
 # Usage: next-calver.sh <tag-prefix> [legacy-prefix ...]
 #   e.g. next-calver.sh "momo/v"            -> 2026.10.23 (or 2026.10.23.1, ...)

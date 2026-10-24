@@ -9,7 +9,7 @@
 # source revision and every digest) plus a ready-to-paste kustomize `images:`
 # block, attached to the GitHub Release and the run summary.
 #
-# See IMAGE-TAGGING-AND-PROMOTION-STANDARD.md, Parts 6-8.
+# See devops-rddev-big-picture: 06 Deployment Standards / 03 Release and Promotion.
 name: Promote to prod (reusable)
 
 on:

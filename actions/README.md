@@ -1,7 +1,7 @@
 # Shared CI building blocks
 
-Org-wide implementation of `IMAGE-TAGGING-AND-PROMOTION-STANDARD.md`
-(in `devops-knpdts-argocd-manifests`). One copy here instead of nine
+Org-wide implementation of the deployment standard documented in
+`devops-rddev-big-picture` → `06 Deployment Standards/`. One copy here instead of nine
 copy-pasted ones in the product repos.
 
 > This repository is **public**. Nothing here may contain secrets, internal
