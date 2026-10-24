@@ -1,0 +1,82 @@
+# Regression test for "prod was rebuilt instead of promoted" (standard, Part 9
+# Phase 6): for every CalVer tag of every image of the train in the client
+# registry, assert digest(client:V) == digest(ronford-digital:V). Read-only.
+name: Digest parity (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      prod-registry:
+        description: Client registry prefix.
+        type: string
+        default: ghcr.io/knpdt-sacco/e-ziada-artifacts
+      config:
+        description: Path to the release train config in the caller repo.
+        type: string
+        default: .github/release-train.json
+    secrets:
+      prod-username:
+        description: User that can read the client registry.
+        required: true
+      prod-password:
+        description: Token that can read the client registry.
+        required: true
+      registry-username:
+        description: Username for ghcr.io/ronford-digital (default github.actor).
+        required: false
+      registry-token:
+        description: Token with packages read on the train's images (default GITHUB_TOKEN).
+        required: false
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Compare digests
+        env:
+          CONFIG: ${{ inputs.config }}
+          PROD: ${{ inputs.prod-registry }}
+          SRC_USER: ${{ secrets.registry-username || github.actor }}
+          SRC_PASS: ${{ secrets.registry-token || github.token }}
+          DST_USER: ${{ secrets.prod-username }}
+          DST_PASS: ${{ secrets.prod-password }}
+        run: |
+          set -euo pipefail
+          auth_dir="$(mktemp -d)"; trap 'rm -rf "$auth_dir"' EXIT
+          echo "$SRC_PASS" | skopeo login --authfile "$auth_dir/src.json" -u "$SRC_USER" --password-stdin ghcr.io >/dev/null
+          echo "$DST_PASS" | skopeo login --authfile "$auth_dir/dst.json" -u "$DST_USER" --password-stdin "${PROD%%/*}" >/dev/null
+          digest_of() { local raw; raw=$(skopeo inspect --authfile "$1" --raw "docker://$2") || return 1; echo "sha256:$(printf '%s' "$raw" | sha256sum | cut -d' ' -f1)"; }
+
+          echo "| Image | Version | Result |" > report.md
+          echo "|---|---|---|" >> report.md
+          mismatches=0
+          while read -r NAME SOURCE <&3; do
+            DST_REPO="${PROD}/${NAME}"
+            tags=$(skopeo list-tags --authfile "$auth_dir/dst.json" "docker://${DST_REPO}" 2>/dev/null \
+              | jq -r '.Tags[]' | grep -E '^[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}(\.[0-9]+)?$' || true)
+            for V in $tags; do
+              D=$(digest_of "$auth_dir/dst.json" "${DST_REPO}:${V}")
+              if ! S=$(digest_of "$auth_dir/src.json" "${SOURCE}:${V}" 2>/dev/null); then
+                echo "| \`${NAME}\` | ${V} | ⚠️ no source tag (released before the standard?) |" >> report.md
+                continue
+              fi
+              if [[ "$S" == "$D" ]]; then
+                echo "| \`${NAME}\` | ${V} | ✅ identical |" >> report.md
+              else
+                echo "::error::${NAME}:${V} differs: ronford-digital ${S} vs client ${D}"
+                echo "| \`${NAME}\` | ${V} | ❌ MISMATCH |" >> report.md
+                mismatches=$((mismatches + 1))
+              fi
+            done
+          done 3< <(jq -r '.images[] | "\(.name) \(.source)"' "$CONFIG")
+
+          { echo "## Digest parity"; cat report.md; } >> "$GITHUB_STEP_SUMMARY"
+          exit $(( mismatches > 0 ))

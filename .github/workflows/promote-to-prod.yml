@@ -1,0 +1,219 @@
+# Promote an already-cut release of a train into the client registry.
+#
+# Replaces build-prod-images.yaml. There is NO `docker build` here: the exact
+# bytes tested in UAT are copied by digest, and the copy is verified digest-for-
+# digest. The version is not free text -- it must be an existing stable release
+# of the train (created by cut-release.yml).
+#
+# Output: trains/<train>/release.yaml (the record the client repo needs: version,
+# source revision and every digest) plus a ready-to-paste kustomize `images:`
+# block, attached to the GitHub Release and the run summary.
+#
+# See IMAGE-TAGGING-AND-PROMOTION-STANDARD.md, Parts 6-8.
+name: Promote to prod (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Existing stable release version, e.g. 2026.10.23
+        type: string
+        required: true
+      prod-registry:
+        description: Client registry prefix.
+        type: string
+        default: ghcr.io/knpdt-sacco/e-ziada-artifacts
+      soak-hours:
+        description: Minimum hours between cutting the release and promoting it.
+        type: number
+        default: 24
+      soak-override-reason:
+        description: Promote before the soak period ends. The reason is recorded in release.yaml.
+        type: string
+        default: ""
+      environment:
+        description: GitHub Environment gating this job (configure required reviewers on it).
+        type: string
+        default: production
+      config:
+        description: Path to the release train config in the caller repo.
+        type: string
+        default: .github/release-train.json
+    secrets:
+      prod-username:
+        description: User that can push to the client registry.
+        required: true
+      prod-password:
+        description: Token that can push to the client registry.
+        required: true
+      registry-username:
+        description: Username for ghcr.io/ronford-digital (default github.actor).
+        required: false
+      registry-token:
+        description: Token with packages read on the train's images (default GITHUB_TOKEN).
+        required: false
+
+permissions:
+  contents: write
+  packages: read
+
+concurrency:
+  group: promote-to-prod-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Validate version
+        id: check
+        env:
+          CONFIG: ${{ inputs.config }}
+          VERSION: ${{ inputs.version }}
+          SOAK_HOURS: ${{ inputs.soak-hours }}
+          OVERRIDE: ${{ inputs.soak-override-reason }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch --tags --force --quiet origin
+          [[ -f "$CONFIG" ]] || { echo "::error::$CONFIG not found"; exit 1; }
+          TRAIN=$(jq -r '.train' "$CONFIG")
+          PREFIX=$(jq -r '.tag_prefix' "$CONFIG")
+          TAG="${PREFIX}${VERSION}"
+
+          # Stable versions only -- release candidates never reach the client.
+          if ! [[ "$VERSION" =~ ^[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}(\.[0-9]+)?$ ]]; then
+            echo "::error::'$VERSION' is not a stable CalVer version (YYYY.M.D[.N]; no -rc.N, no prod- prefix)"
+            exit 1
+          fi
+          if ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::No release ${TAG}. Run 'Cut release' first -- promotion only copies an existing release."
+            exit 1
+          fi
+          REVISION=$(git rev-list -n1 "$TAG")
+
+          CREATED=$(gh release view "$TAG" --json createdAt --jq .createdAt)
+          AGE_H=$(( ( $(date -u +%s) - $(date -u -d "$CREATED" +%s) ) / 3600 ))
+          if (( AGE_H < SOAK_HOURS )); then
+            if [[ -z "$OVERRIDE" ]]; then
+              echo "::error::${TAG} was cut ${AGE_H}h ago; the soak period is ${SOAK_HOURS}h. Wait, or set soak-override-reason."
+              exit 1
+            fi
+            echo "::warning::Soak period overridden after ${AGE_H}h: ${OVERRIDE}"
+          fi
+
+          {
+            echo "train=$TRAIN"
+            echo "tag=$TAG"
+            echo "revision=$REVISION"
+            echo "released-at=$CREATED"
+            echo "age-hours=$AGE_H"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: List copies
+        id: pairs
+        env:
+          CONFIG: ${{ inputs.config }}
+          VERSION: ${{ inputs.version }}
+          PROD: ${{ inputs.prod-registry }}
+        run: |
+          set -euo pipefail
+          {
+            echo "images<<__EOF__"
+            jq -r --arg v "$VERSION" --arg prod "$PROD" \
+              '.images[] | "\(.source):\($v) \($prod)/\(.name):\($v)"' "$CONFIG"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Copy by digest into the client registry
+        id: copy
+        uses: ronford-digital/.github/actions/copy-image@v1
+        with:
+          images: ${{ steps.pairs.outputs.images }}
+          source-username: ${{ secrets.registry-username || github.actor }}
+          source-password: ${{ secrets.registry-token || github.token }}
+          destination-username: ${{ secrets.prod-username }}
+          destination-password: ${{ secrets.prod-password }}
+
+      - name: Write release record
+        env:
+          CONFIG: ${{ inputs.config }}
+          VERSION: ${{ inputs.version }}
+          PROD: ${{ inputs.prod-registry }}
+          TRAIN: ${{ steps.check.outputs.train }}
+          TAG: ${{ steps.check.outputs.tag }}
+          REVISION: ${{ steps.check.outputs.revision }}
+          RELEASED_AT: ${{ steps.check.outputs.released-at }}
+          AGE_H: ${{ steps.check.outputs.age-hours }}
+          OVERRIDE: ${{ inputs.soak-override-reason }}
+          DIGESTS: ${{ steps.copy.outputs.digests }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "out/trains/${TRAIN}"
+          REC="out/trains/${TRAIN}/release.yaml"
+
+          # Generated, never hand-written (standard, Part 7.4). Plain YAML via
+          # jq so the runner needs no extra tooling; every value is quoted.
+          q() { jq -Rn --arg s "$1" '$s'; }
+          {
+            echo "# Generated by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "# Do not edit by hand. To roll back, revert the commit that changed this file."
+            echo "train: $(q "$TRAIN")"
+            echo "version: $(q "$VERSION")"
+            echo "channel: \"stable\""
+            echo "promoted_at: $(q "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
+            echo "promoted_by: $(q "$GITHUB_ACTOR")"
+            echo "source:"
+            echo "  repo: $(q "$GITHUB_REPOSITORY")"
+            echo "  revision: $(q "$REVISION")"
+            echo "  git_tag: $(q "$TAG")"
+            echo "certified:"
+            echo "  released_at: $(q "$RELEASED_AT")"
+            echo "  hours_before_promotion: ${AGE_H}"
+            [[ -n "$OVERRIDE" ]] && echo "  soak_override_reason: $(q "$OVERRIDE")"
+            echo "services:"
+            jq -r --arg v "$VERSION" --arg prod "$PROD" --argjson d "$DIGESTS" '
+              .images[] | ($prod + "/" + .name) as $img |
+              "  \(.name):\n    image: \"\($img)\"\n    tag: \"\($v)\"\n    digest: \"\($d[$img + ":" + $v])\"\n    promoted_from: \"\(.source)@\($d[$img + ":" + $v])\""' "$CONFIG"
+          } > "$REC"
+
+          # Tag for humans, digest for the cluster (standard, Part 6.4).
+          {
+            echo "# kustomization.yml images: block for the client repo"
+            echo "images:"
+            jq -r --arg v "$VERSION" --arg prod "$PROD" --argjson d "$DIGESTS" '
+              .images[] | ($prod + "/" + .name) as $img |
+              "  - name: \($img)\n    newTag: \"\($v)\"\n    digest: \($d[$img + ":" + $v])"' "$CONFIG"
+          } > out/kustomize-images.yaml
+
+          cp "$REC" "out/release-${TRAIN}-${VERSION}.yaml"
+          gh release upload "$TAG" "out/release-${TRAIN}-${VERSION}.yaml" out/kustomize-images.yaml --clobber
+
+          {
+            echo "## ✅ Promoted ${TRAIN} ${VERSION} to \`${PROD}\`"
+            echo ""
+            echo "Every image was copied by digest and verified identical. Nothing was rebuilt."
+            echo ""
+            echo "### trains/${TRAIN}/release.yaml"
+            echo '```yaml'
+            cat "$REC"
+            echo '```'
+            echo "### Client kustomization"
+            echo '```yaml'
+            cat out/kustomize-images.yaml
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload release record
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ steps.check.outputs.train }}-${{ inputs.version }}
+          path: out/

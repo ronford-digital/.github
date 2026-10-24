@@ -1,0 +1,221 @@
+# Cut a release of a release train WITHOUT rebuilding anything.
+#
+# Takes the images CI already built, scanned and deployed to UAT for one commit,
+# gives them the train's next CalVer tag (same digest -- a registry-side retag),
+# then creates the git tag <train>/v<version> and a GitHub Release with
+# generated notes and the digest of every image.
+#
+# Called from each product repo's .github/workflows/cut-release.yml. The train
+# is described by the caller's .github/release-train.json:
+#
+#   {
+#     "train": "momo",
+#     "tag_prefix": "momo/v",
+#     "legacy_prefixes": "",                 # optional, cut-over only
+#     "ci_tag": "{branch}-{sha8}",           # how CI tags a commit's images
+#     "images": [
+#       { "name": "knpdts-core-api",          # image name in the client registry
+#         "source": "ghcr.io/ronford-digital/backend-knpdts-momo-service/knpdts-core-api" }
+#     ]
+#   }
+#
+# See IMAGE-TAGGING-AND-PROMOTION-STANDARD.md (devops-knpdts-argocd-manifests).
+name: Cut release (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      commit:
+        description: >
+          Full commit SHA to release (default: the head of the dispatched branch).
+          Pass the commit that has been running in UAT, not whatever landed since.
+        type: string
+        default: ""
+      channel:
+        description: "stable -> 2026.10.23, rc -> 2026.10.23-rc.1"
+        type: string
+        default: stable
+      config:
+        description: Path to the release train config in the caller repo.
+        type: string
+        default: .github/release-train.json
+    secrets:
+      registry-username:
+        description: Username for ghcr.io/ronford-digital (default github.actor).
+        required: false
+      registry-token:
+        description: Token with packages read+write on the train's images (default GITHUB_TOKEN).
+        required: false
+    outputs:
+      version:
+        description: The released version.
+        value: ${{ jobs.cut-release.outputs.version }}
+      tag:
+        description: The git tag created.
+        value: ${{ jobs.cut-release.outputs.tag }}
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  # Two cuts of the same train at once would compute the same version.
+  group: cut-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  cut-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.calver.outputs.version }}
+      tag: ${{ steps.calver.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Read train config
+        id: config
+        env:
+          CONFIG: ${{ inputs.config }}
+          CHANNEL: ${{ inputs.channel }}
+          COMMIT_INPUT: ${{ inputs.commit }}
+        run: |
+          set -euo pipefail
+          [[ -f "$CONFIG" ]] || { echo "::error::$CONFIG not found"; exit 1; }
+          case "$CHANNEL" in
+            stable) PRERELEASE="" ;;
+            rc)     PRERELEASE="rc" ;;
+            *) echo "::error::channel must be stable or rc, got '$CHANNEL'"; exit 1 ;;
+          esac
+
+          COMMIT="${COMMIT_INPUT:-$GITHUB_SHA}"
+          if ! [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::commit must be a FULL 40-character SHA, got '$COMMIT'"
+            exit 1
+          fi
+          # Only release commits that are actually on the dispatched branch --
+          # that is the branch CI built and deployed them from.
+          if ! git merge-base --is-ancestor "$COMMIT" "$GITHUB_SHA"; then
+            echo "::error::$COMMIT is not on ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+
+          SHA8="${COMMIT:0:8}"
+          CI_TAG=$(jq -r '.ci_tag' "$CONFIG")
+          CI_TAG="${CI_TAG//\{branch\}/$GITHUB_REF_NAME}"
+          CI_TAG="${CI_TAG//\{sha8\}/$SHA8}"
+
+          {
+            echo "train=$(jq -r '.train' "$CONFIG")"
+            echo "tag-prefix=$(jq -r '.tag_prefix' "$CONFIG")"
+            echo "legacy-prefixes=$(jq -r '.legacy_prefixes // ""' "$CONFIG")"
+            echo "prerelease=$PRERELEASE"
+            echo "commit=$COMMIT"
+            echo "ci-tag=$CI_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Compute version
+        id: calver
+        uses: ronford-digital/.github/actions/next-calver@v1
+        with:
+          tag-prefix: ${{ steps.config.outputs.tag-prefix }}
+          legacy-prefixes: ${{ steps.config.outputs.legacy-prefixes }}
+          prerelease: ${{ steps.config.outputs.prerelease }}
+
+      - name: List retags
+        id: pairs
+        env:
+          CONFIG: ${{ inputs.config }}
+          CI_TAG: ${{ steps.config.outputs.ci-tag }}
+          VERSION: ${{ steps.calver.outputs.version }}
+        run: |
+          set -euo pipefail
+          {
+            echo "images<<__EOF__"
+            jq -r --arg ci "$CI_TAG" --arg v "$VERSION" \
+              '.images[] | "\(.source):\($ci) \(.source):\($v)"' "$CONFIG"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      # Same registry on both sides: this is a retag of the tested digest.
+      - name: Tag the tested images with the release version
+        id: copy
+        uses: ronford-digital/.github/actions/copy-image@v1
+        with:
+          images: ${{ steps.pairs.outputs.images }}
+          source-username: ${{ secrets.registry-username || github.actor }}
+          source-password: ${{ secrets.registry-token || github.token }}
+          destination-username: ${{ secrets.registry-username || github.actor }}
+          destination-password: ${{ secrets.registry-token || github.token }}
+
+      - name: Check images were built from this commit
+        env:
+          DIGESTS: ${{ steps.copy.outputs.digests }}
+          COMMIT: ${{ steps.config.outputs.commit }}
+          REG_USER: ${{ secrets.registry-username || github.actor }}
+          REG_PASS: ${{ secrets.registry-token || github.token }}
+        run: |
+          set -euo pipefail
+          echo "$REG_PASS" | skopeo login -u "$REG_USER" --password-stdin ghcr.io >/dev/null
+          for ref in $(jq -r 'keys[]' <<< "$DIGESTS"); do
+            rev=$(skopeo inspect --config "docker://$ref" \
+              | jq -r '.config.Labels["org.opencontainers.image.revision"] // empty')
+            if [[ -z "$rev" ]]; then
+              # Images built before the OCI-label change carry no revision label;
+              # the CI tag (which embeds the sha) is the only link we have.
+              echo "::warning::$ref has no org.opencontainers.image.revision label (built before the labelling change)"
+            elif [[ "$rev" != "$COMMIT" ]]; then
+              echo "::error::$ref was built from $rev, not $COMMIT"
+              exit 1
+            fi
+          done
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.calver.outputs.tag }}
+          VERSION: ${{ steps.calver.outputs.version }}
+          PREVIOUS: ${{ steps.calver.outputs.previous-tag }}
+          COMMIT: ${{ steps.config.outputs.commit }}
+          CI_TAG: ${{ steps.config.outputs.ci-tag }}
+          TRAIN: ${{ steps.config.outputs.train }}
+          CHANNEL: ${{ inputs.channel }}
+          DIGESTS: ${{ steps.copy.outputs.digests }}
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg train "$TRAIN" --arg version "$VERSION" --arg channel "$CHANNEL" \
+            --arg repo "$GITHUB_REPOSITORY" --arg revision "$COMMIT" --arg git_tag "$TAG" \
+            --arg ci_tag "$CI_TAG" --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg released_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson digests "$DIGESTS" \
+            '{train: $train, version: $version, channel: $channel, released_at: $released_at,
+              source: {repo: $repo, revision: $revision, git_tag: $git_tag, ci_tag: $ci_tag},
+              build_run: $run,
+              images: ($digests | to_entries | map({image: (.key | sub(":[^:/]+$"; "")), tag: $version, digest: .value}))}' \
+            > release.json
+
+          {
+            echo "## Images"
+            echo ""
+            echo "Built once by CI from \`${COMMIT}\` (CI tag \`${CI_TAG}\`), tested in UAT, then"
+            echo "tagged \`${VERSION}\` **without rebuilding**. Promote with the *Promote to prod* workflow."
+            echo ""
+            echo "| Image | Digest |"
+            echo "|---|---|"
+            jq -r '.images[] | "| `\(.image):\(.tag)` | `\(.digest)` |"' release.json
+            echo ""
+          } > notes.md
+
+          ARGS=(--title "${TRAIN} ${VERSION}" --target "$COMMIT" --notes-file notes.md --generate-notes)
+          [[ -n "$PREVIOUS" ]] && ARGS+=(--notes-start-tag "$PREVIOUS")
+          [[ "$CHANNEL" == "rc" ]] && ARGS+=(--prerelease)
+          gh release create "$TAG" "${ARGS[@]}"
+          gh release upload "$TAG" release.json
+
+          {
+            echo "## 🚂 ${TRAIN} ${VERSION} (${CHANNEL})"
+            cat notes.md
+          } >> "$GITHUB_STEP_SUMMARY"

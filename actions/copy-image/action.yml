@@ -1,0 +1,128 @@
+name: Copy images by digest
+description: >
+  Registry-to-registry copy that preserves the digest (no build, no pull through
+  a docker daemon), then VERIFIES source and destination digests are identical.
+  Used both to retag a tested image with its release version and to promote it
+  into the client registry.
+
+  Uses skopeo rather than crane because source and destination are both on
+  ghcr.io but need DIFFERENT credentials (ronford-digital vs the client org);
+  crane keeps one credential per registry host, skopeo takes one auth file per
+  side. skopeo is preinstalled on GitHub-hosted Ubuntu runners.
+
+inputs:
+  images:
+    description: >
+      One copy per line: "<source-ref> <destination-ref>". The source may be by
+      tag or digest; the destination is by tag, e.g.
+      ghcr.io/ronford-digital/x:177e7774 ghcr.io/ronford-digital/x:2026.10.23
+    required: true
+  source-username:
+    description: Username for the source registry.
+    required: true
+  source-password:
+    description: Password / token for the source registry.
+    required: true
+  destination-username:
+    description: Username for the destination registry.
+    required: true
+  destination-password:
+    description: Password / token for the destination registry.
+    required: true
+
+outputs:
+  digests:
+    description: 'JSON object {"<destination-ref>": "sha256:..."}.'
+    value: ${{ steps.copy.outputs.digests }}
+
+runs:
+  using: composite
+  steps:
+    - name: Copy and verify
+      id: copy
+      shell: bash
+      env:
+        IMAGES: ${{ inputs.images }}
+        SRC_USER: ${{ inputs.source-username }}
+        SRC_PASS: ${{ inputs.source-password }}
+        DST_USER: ${{ inputs.destination-username }}
+        DST_PASS: ${{ inputs.destination-password }}
+      run: |
+        set -euo pipefail
+        auth_dir="$(mktemp -d)"
+        trap 'rm -rf "$auth_dir"' EXIT
+        src_auth="$auth_dir/src.json"
+        dst_auth="$auth_dir/dst.json"
+
+        login_once() { # <authfile> <user> <pass> <ref>
+          local host="${4%%/*}"
+          grep -qs "\"$host\"" "$1" && return 0
+          echo "$3" | skopeo login --authfile "$1" -u "$2" --password-stdin "$host" >/dev/null
+        }
+
+        # Digest of the top-level manifest (the index, when the image carries
+        # SBOM/provenance attestations) exactly as the registry serves it --
+        # the identity the cluster pulls.
+        digest_of() { # <authfile> <ref>
+          local raw
+          raw=$(skopeo inspect --authfile "$1" --raw "docker://$2") || return 1
+          echo "sha256:$(printf '%s' "$raw" | sha256sum | cut -d' ' -f1)"
+        }
+
+        repo_of() { # strip :tag / @digest, keeping any registry :port
+          local r="${1%%@*}"
+          [[ "${r##*/}" == *:* ]] && r="${r%:*}"
+          echo "$r"
+        }
+
+        echo '{}' > "$auth_dir/digests.json"
+        failed=0
+        # fd 3, so nothing inside the loop can swallow the remaining lines from stdin.
+        while read -r SRC DST <&3; do
+          [[ -z "${SRC:-}" ]] && continue
+          if [[ -z "${DST:-}" ]]; then
+            echo "::error::Malformed line (need '<source> <destination>'): $SRC"
+            exit 1
+          fi
+          login_once "$src_auth" "$SRC_USER" "$SRC_PASS" "$SRC"
+          login_once "$dst_auth" "$DST_USER" "$DST_PASS" "$DST"
+
+          if ! SRC_DIGEST=$(digest_of "$src_auth" "$SRC"); then
+            echo "::error::Source image not found: $SRC"
+            failed=1
+            continue
+          fi
+
+          # Version tags are immutable by policy: never move an existing one.
+          if DST_EXISTING=$(digest_of "$dst_auth" "$DST" 2>/dev/null); then
+            if [[ "$DST_EXISTING" != "$SRC_DIGEST" ]]; then
+              echo "::error::$DST already exists with a DIFFERENT digest ($DST_EXISTING, source is $SRC_DIGEST). Version tags are immutable -- cut a new version instead."
+              failed=1
+              continue
+            fi
+            echo "::notice::$DST already points at $SRC_DIGEST -- nothing to copy"
+          else
+            # Copy BY DIGEST so a tag moving mid-copy can't change what we ship.
+            # --all keeps the whole index (platform images + attestations);
+            # --preserve-digests makes skopeo fail rather than re-encode anything.
+            skopeo copy --all --preserve-digests --retry-times 3 \
+              --src-authfile "$src_auth" --dest-authfile "$dst_auth" \
+              "docker://$(repo_of "$SRC")@${SRC_DIGEST}" "docker://${DST}"
+          fi
+
+          # MANDATORY verification gate (standard, Part 6.3).
+          DST_DIGEST=$(digest_of "$dst_auth" "$DST")
+          if [[ "$SRC_DIGEST" != "$DST_DIGEST" ]]; then
+            echo "::error::DIGEST MISMATCH for $DST"
+            echo "  source     : $SRC_DIGEST"
+            echo "  destination: $DST_DIGEST"
+            failed=1
+            continue
+          fi
+          echo "verified $DST -> $DST_DIGEST"
+          jq --arg k "$DST" --arg v "$DST_DIGEST" '.[$k] = $v' "$auth_dir/digests.json" > "$auth_dir/d.tmp"
+          mv "$auth_dir/d.tmp" "$auth_dir/digests.json"
+        done 3<<< "$IMAGES"
+
+        echo "digests=$(jq -c . "$auth_dir/digests.json")" >> "$GITHUB_OUTPUT"
+        exit "$failed"

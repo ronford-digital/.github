@@ -1,0 +1,64 @@
+name: Next CalVer
+description: >
+  Generate the next CalVer release version (YYYY.M.D[.N][-rc.N]) for a release
+  train from its git tags. Tags are generated, never typed.
+
+inputs:
+  tag-prefix:
+    description: Git tag prefix of the release train, e.g. "momo/v".
+    required: true
+  legacy-prefixes:
+    description: >
+      Space-separated older tag prefixes whose versions must not be reused
+      (cut-over only), e.g. "v".
+    required: false
+    default: ""
+  prerelease:
+    description: Empty for a stable release, or "rc" for a release candidate.
+    required: false
+    default: ""
+
+outputs:
+  version:
+    description: The version, e.g. 2026.10.23 or 2026.10.23-rc.1.
+    value: ${{ steps.calver.outputs.version }}
+  tag:
+    description: The git tag, e.g. momo/v2026.10.23.
+    value: ${{ steps.calver.outputs.tag }}
+  previous-tag:
+    description: >
+      Most recent STABLE tag of this train (any listed prefix), for release
+      notes. Empty on the first release.
+    value: ${{ steps.calver.outputs.previous-tag }}
+
+runs:
+  using: composite
+  steps:
+    - name: Compute version
+      id: calver
+      shell: bash
+      env:
+        TAG_PREFIX: ${{ inputs.tag-prefix }}
+        LEGACY_PREFIXES: ${{ inputs.legacy-prefixes }}
+        PRERELEASE: ${{ inputs.prerelease }}
+      run: |
+        set -euo pipefail
+        # The caller's checkout may be shallow or tag-less; versions are derived
+        # from tags, so a missing tag would silently reuse a version.
+        git fetch --tags --force --quiet origin
+
+        read -r -a legacy <<< "$LEGACY_PREFIXES"
+        VERSION=$("${GITHUB_ACTION_PATH}/next-calver.sh" "$TAG_PREFIX" "${legacy[@]}")
+
+        # Stable tags only (no -rc.N), newest by creation date -- never `| sort`,
+        # unpadded CalVer does not sort lexically.
+        PREVIOUS=$(
+          for p in "$TAG_PREFIX" "${legacy[@]}"; do
+            git tag -l "${p}[0-9]*" --format='%(creatordate:unix) %(refname:short)'
+          done | grep -vE -- '-[a-z]+\.[0-9]+$' | sort -rn | head -1 | cut -d' ' -f2 || true
+        )
+
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        echo "tag=${TAG_PREFIX}${VERSION}" >> "$GITHUB_OUTPUT"
+        echo "previous-tag=$PREVIOUS" >> "$GITHUB_OUTPUT"
+        echo "::notice::Next version for ${TAG_PREFIX}: ${VERSION} (previous: ${PREVIOUS:-none})"
