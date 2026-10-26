@@ -20,8 +20,8 @@ copy-pasted ones in the product repos.
 | Workflow | What it does |
 |---|---|
 | `.github/workflows/cut-release.yml` | Tag the images CI built for one commit with the train's next CalVer (same digest), create `<train>/v<version>` and a GitHub Release with generated notes and digests. |
-| `.github/workflows/promote-to-prod.yml` | Copy a cut release into the client registry by digest, verify, and emit `trains/<train>/release.yaml` + a kustomize `images:` block (tag **and** digest). |
-| `.github/workflows/digest-parity.yml` | Scheduled check that every version in the client registry is byte-identical to ours. |
+| `.github/workflows/promote-to-prod.yml` | Copy the digests recorded in a cut release's `release.json` into the client registry, verify, and emit `trains/<train>/release.yaml` + a kustomize `images:` block (tag **and** digest). |
+| `.github/workflows/digest-parity.yml` | Scheduled check that every version in the client registry is byte-identical to ours. Fails on registry errors too; versions older than the optional `legacy-before` input may lack a source tag. |
 
 All three read the caller's `.github/release-train.json`:
 
@@ -41,7 +41,11 @@ All three read the caller's `.github/release-train.json`:
 ```
 
 - `name` is the image name in the client registry (`<prod-registry>/<name>`).
-- `ci_tag` is how CI tags a commit's images; `{branch}` and `{sha8}` are substituted.
+- `ci_tag` is how CI tags a commit's images; `{branch}` and `{sha8}` are substituted,
+  then characters outside `[a-zA-Z0-9._-]` become `-` (as `build-image` does), so
+  branch `release/pilot` gives `release-pilot-<sha8>`.
+- `promote-to-prod` reads `images` from the config **at the release's tagged
+  revision**, not from the branch it runs on.
 
 ## The flow
 

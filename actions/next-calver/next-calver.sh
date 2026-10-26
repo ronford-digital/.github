@@ -44,7 +44,7 @@ month=$((10#$(date -u +%m)))
 day=$((10#$(date -u +%d)))
 today_version="${year}.${month}.${day}"
 
-# A version is taken if a stable tag exists for it under ANY of the prefixes.
+# A version is taken if a tag exists for it under ANY of the prefixes.
 version_taken() {
     local p
     for p in "${prefixes[@]}"; do
@@ -67,8 +67,10 @@ if [[ -z "$prerelease" ]]; then
     exit 0
 fi
 
+# Check every prefix, as for stable versions: the image tag is the bare
+# version, so an rc cut under a legacy prefix reserves it too.
 n=1
-while [[ -n "$(git tag -l "${prefixes[0]}${version}-${prerelease}.${n}")" ]]; do
+while version_taken "${version}-${prerelease}.${n}"; do
     n=$((n + 1))
 done
 

@@ -3,7 +3,8 @@
 # Replaces build-prod-images.yaml. There is NO `docker build` here: the exact
 # bytes tested in UAT are copied by digest, and the copy is verified digest-for-
 # digest. The version is not free text -- it must be an existing stable release
-# of the train (created by cut-release.yml).
+# of the train (created by cut-release.yml), and what is copied is the set of
+# digests recorded in that release's release.json -- never a live tag.
 #
 # Output: trains/<train>/release.yaml (the record the client repo needs: version,
 # source revision and every digest) plus a ready-to-paste kustomize `images:`
@@ -84,8 +85,7 @@ jobs:
           set -euo pipefail
           git fetch --tags --force --quiet origin
           [[ -f "$CONFIG" ]] || { echo "::error::$CONFIG not found"; exit 1; }
-          TRAIN=$(jq -r '.train' "$CONFIG")
-          PREFIX=$(jq -r '.tag_prefix' "$CONFIG")
+          PREFIX=$(jq -er '.tag_prefix' "$CONFIG")
           TAG="${PREFIX}${VERSION}"
 
           # Stable versions only -- release candidates never reach the client.
@@ -99,28 +99,76 @@ jobs:
           fi
           REVISION=$(git rev-list -n1 "$TAG")
 
-          CREATED=$(gh release view "$TAG" --json createdAt --jq .createdAt)
-          AGE_H=$(( ( $(date -u +%s) - $(date -u -d "$CREATED" +%s) ) / 3600 ))
+          # A stable-looking tag is not enough: the GitHub Release must be
+          # published and not a prerelease. Soak runs from publication.
+          REL=$(gh release view "$TAG" --json isDraft,isPrerelease,publishedAt)
+          if [[ "$(jq -r '.isDraft' <<< "$REL")" != "false" ]]; then
+            echo "::error::${TAG} is a draft release; publish it first."
+            exit 1
+          fi
+          if [[ "$(jq -r '.isPrerelease' <<< "$REL")" != "false" ]]; then
+            echo "::error::${TAG} is marked as a prerelease; only stable releases are promoted."
+            exit 1
+          fi
+          PUBLISHED=$(jq -er '.publishedAt' <<< "$REL")
+          AGE_H=$(( ( $(date -u +%s) - $(date -u -d "$PUBLISHED" +%s) ) / 3600 ))
           if (( AGE_H < SOAK_HOURS )); then
             if [[ -z "$OVERRIDE" ]]; then
-              echo "::error::${TAG} was cut ${AGE_H}h ago; the soak period is ${SOAK_HOURS}h. Wait, or set soak-override-reason."
+              echo "::error::${TAG} was published ${AGE_H}h ago; the soak period is ${SOAK_HOURS}h. Wait, or set soak-override-reason."
               exit 1
             fi
             echo "::warning::Soak period overridden after ${AGE_H}h: ${OVERRIDE}"
+          fi
+
+          # Promote what was RELEASED, not what tags or config say today: the
+          # digests come from the release's release.json, and the client image
+          # names from the train config as it was at the tagged revision.
+          WORK="$RUNNER_TEMP/release"
+          mkdir -p "$WORK"
+          gh release download "$TAG" --pattern release.json --dir "$WORK" --clobber
+          if ! git show "${REVISION}:${CONFIG}" > "$WORK/config.json"; then
+            echo "::error::$CONFIG does not exist at ${TAG} (${REVISION})"
+            exit 1
+          fi
+          TRAIN=$(jq -er '.train' "$WORK/config.json")
+
+          if ! jq -e --arg train "$TRAIN" --arg v "$VERSION" --arg rev "$REVISION" --arg tag "$TAG" '
+              .train == $train and .version == $v and .channel == "stable"
+              and .source.revision == $rev and .source.git_tag == $tag
+              and (.images | type == "array" and length > 0)
+              and (.images | all((.digest | test("^sha256:[0-9a-f]{64}$")) and .tag == $v))' \
+              "$WORK/release.json" >/dev/null; then
+            echo "::error::release.json on ${TAG} does not match train ${TRAIN}, version ${VERSION}, revision ${REVISION}:"
+            cat "$WORK/release.json"
+            exit 1
+          fi
+
+          # Join config images (name, source) to recorded digests by source repo.
+          # The image sets must match exactly in both directions.
+          jq -n --slurpfile cfg "$WORK/config.json" --slurpfile rel "$WORK/release.json" '
+              ($rel[0].images | map({key: .image, value: .digest}) | from_entries) as $d
+              | $cfg[0].images | map({name, source, digest: $d[.source]})' > "$WORK/images.json"
+          if ! jq -e --slurpfile rel "$WORK/release.json" '
+              all(.[]; .digest != null)
+              and ((map(.source) | sort) == ($rel[0].images | map(.image) | sort))' \
+              "$WORK/images.json" >/dev/null; then
+            echo "::error::Images in ${CONFIG} at ${TAG} do not match the images recorded in release.json"
+            exit 1
           fi
 
           {
             echo "train=$TRAIN"
             echo "tag=$TAG"
             echo "revision=$REVISION"
-            echo "released-at=$CREATED"
+            echo "released-at=$PUBLISHED"
             echo "age-hours=$AGE_H"
+            echo "images-file=$WORK/images.json"
           } >> "$GITHUB_OUTPUT"
 
       - name: List copies
         id: pairs
         env:
-          CONFIG: ${{ inputs.config }}
+          IMAGES_FILE: ${{ steps.check.outputs.images-file }}
           VERSION: ${{ inputs.version }}
           PROD: ${{ inputs.prod-registry }}
         run: |
@@ -128,7 +176,7 @@ jobs:
           {
             echo "images<<__EOF__"
             jq -r --arg v "$VERSION" --arg prod "$PROD" \
-              '.images[] | "\(.source):\($v) \($prod)/\(.name):\($v)"' "$CONFIG"
+              '.[] | "\(.source)@\(.digest) \($prod)/\(.name):\($v)"' "$IMAGES_FILE"
             echo "__EOF__"
           } >> "$GITHUB_OUTPUT"
 
@@ -144,7 +192,7 @@ jobs:
 
       - name: Write release record
         env:
-          CONFIG: ${{ inputs.config }}
+          IMAGES_FILE: ${{ steps.check.outputs.images-file }}
           VERSION: ${{ inputs.version }}
           PROD: ${{ inputs.prod-registry }}
           TRAIN: ${{ steps.check.outputs.train }}
@@ -181,8 +229,8 @@ jobs:
             [[ -n "$OVERRIDE" ]] && echo "  soak_override_reason: $(q "$OVERRIDE")"
             echo "services:"
             jq -r --arg v "$VERSION" --arg prod "$PROD" --argjson d "$DIGESTS" '
-              .images[] | ($prod + "/" + .name) as $img |
-              "  \(.name):\n    image: \"\($img)\"\n    tag: \"\($v)\"\n    digest: \"\($d[$img + ":" + $v])\"\n    promoted_from: \"\(.source)@\($d[$img + ":" + $v])\""' "$CONFIG"
+              .[] | ($prod + "/" + .name) as $img |
+              "  \(.name):\n    image: \"\($img)\"\n    tag: \"\($v)\"\n    digest: \"\($d[$img + ":" + $v])\"\n    promoted_from: \"\(.source)@\(.digest)\""' "$IMAGES_FILE"
           } > "$REC"
 
           # Tag for humans, digest for the cluster (standard, Part 6.4).
@@ -190,8 +238,8 @@ jobs:
             echo "# kustomization.yml images: block for the client repo"
             echo "images:"
             jq -r --arg v "$VERSION" --arg prod "$PROD" --argjson d "$DIGESTS" '
-              .images[] | ($prod + "/" + .name) as $img |
-              "  - name: \($img)\n    newTag: \"\($v)\"\n    digest: \($d[$img + ":" + $v])"' "$CONFIG"
+              .[] | ($prod + "/" + .name) as $img |
+              "  - name: \($img)\n    newTag: \"\($v)\"\n    digest: \($d[$img + ":" + $v])"' "$IMAGES_FILE"
           } > out/kustomize-images.yaml
 
           cp "$REC" "out/release-${TRAIN}-${VERSION}.yaml"

@@ -9,7 +9,9 @@ inputs:
     description: Full image name without tag, e.g. ghcr.io/ronford-digital/knpdts-cbs-ftip-core-api.
     required: true
   tags:
-    description: Newline-separated tag VALUES (not full refs). Must not contain `latest`.
+    description: >
+      Newline-separated tag VALUES (not full refs). Must not contain `latest`.
+      Runs of characters outside [a-zA-Z0-9._-] become `-`.
     required: true
   file:
     description: Path to the Dockerfile.
@@ -73,6 +75,10 @@ runs:
         while IFS= read -r t; do
           t="$(echo "$t" | xargs)"
           [[ -z "$t" ]] && continue
+          # Same sanitisation metadata-action applies before pushing (e.g.
+          # feature/x-deadbeef -> feature-x-deadbeef), so `ref` matches what
+          # is actually pushed. cut-release.yml normalises CI tags identically.
+          t="$(sed -E 's/[^a-zA-Z0-9._-]+/-/g' <<< "$t")"
           # RULE: no mutable tags. A manifest pinned to one cannot be rolled back.
           if [[ "$t" == "latest" || "$t" == *-latest ]]; then
             echo "::error::Refusing to push mutable tag '$t' (see 06 Deployment Standards / 01 Image Tagging and Versioning)"

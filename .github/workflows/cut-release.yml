@@ -85,6 +85,14 @@ jobs:
         run: |
           set -euo pipefail
           [[ -f "$CONFIG" ]] || { echo "::error::$CONFIG not found"; exit 1; }
+          if ! jq -e '
+              ([.train, .tag_prefix, .ci_tag] | all(type == "string" and length > 0))
+              and (.images | type == "array" and length > 0)
+              and (.images | all((.name | type == "string" and length > 0)
+                             and (.source | type == "string" and length > 0)))' "$CONFIG" >/dev/null; then
+            echo "::error::$CONFIG must set train, tag_prefix, ci_tag and a non-empty images[] of {name, source}"
+            exit 1
+          fi
           case "$CHANNEL" in
             stable) PRERELEASE="" ;;
             rc)     PRERELEASE="rc" ;;
@@ -107,6 +115,9 @@ jobs:
           CI_TAG=$(jq -r '.ci_tag' "$CONFIG")
           CI_TAG="${CI_TAG//\{branch\}/$GITHUB_REF_NAME}"
           CI_TAG="${CI_TAG//\{sha8\}/$SHA8}"
+          # build-image (metadata-action) pushes the tag sanitised this way, so
+          # e.g. branch release/pilot is tagged release-pilot-<sha8>.
+          CI_TAG="$(sed -E 's/[^a-zA-Z0-9._-]+/-/g' <<< "$CI_TAG")"
 
           {
             echo "train=$(jq -r '.train' "$CONFIG")"
@@ -115,6 +126,52 @@ jobs:
             echo "prerelease=$PRERELEASE"
             echo "commit=$COMMIT"
             echo "ci-tag=$CI_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+      # Resolve every CI image to a digest and check its provenance BEFORE any
+      # version tag is written. Version tags are immutable, so a failure after
+      # tagging would leave orphan tags that block a corrected retry.
+      - name: Resolve and verify the tested images
+        id: resolve
+        env:
+          CONFIG: ${{ inputs.config }}
+          CI_TAG: ${{ steps.config.outputs.ci-tag }}
+          COMMIT: ${{ steps.config.outputs.commit }}
+          REG_USER: ${{ secrets.registry-username || github.actor }}
+          REG_PASS: ${{ secrets.registry-token || github.token }}
+        run: |
+          set -euo pipefail
+          echo "$REG_PASS" | skopeo login -u "$REG_USER" --password-stdin ghcr.io >/dev/null
+          sources=$(jq -r '.images[].source' "$CONFIG")
+          resolved=""
+          failed=0
+          for SOURCE in $sources; do
+            # Hash the raw manifest stream (the index the cluster pulls).
+            if ! sum=$(skopeo inspect --raw "docker://${SOURCE}:${CI_TAG}" | sha256sum); then
+              echo "::error::Could not inspect ${SOURCE}:${CI_TAG}"
+              failed=1
+              continue
+            fi
+            ref="${SOURCE}@sha256:${sum%% *}"
+            rev=$(skopeo inspect --config "docker://$ref" \
+              | jq -r '.config.Labels["org.opencontainers.image.revision"] // empty')
+            if [[ -z "$rev" ]]; then
+              # Images built before the OCI-label change carry no revision label;
+              # the CI tag (which embeds the sha) is the only link we have.
+              echo "::warning::${SOURCE}:${CI_TAG} has no org.opencontainers.image.revision label (built before the labelling change)"
+            elif [[ "$rev" != "$COMMIT" ]]; then
+              echo "::error::${SOURCE}:${CI_TAG} was built from $rev, not $COMMIT"
+              failed=1
+              continue
+            fi
+            echo "resolved ${SOURCE}:${CI_TAG} -> $ref"
+            resolved+="${ref}"$'\n'
+          done
+          (( failed == 0 )) || exit 1
+          {
+            echo "images<<__EOF__"
+            printf '%s' "$resolved"
+            echo "__EOF__"
           } >> "$GITHUB_OUTPUT"
 
       - name: Compute version
@@ -128,19 +185,19 @@ jobs:
       - name: List retags
         id: pairs
         env:
-          CONFIG: ${{ inputs.config }}
-          CI_TAG: ${{ steps.config.outputs.ci-tag }}
+          RESOLVED: ${{ steps.resolve.outputs.images }}
           VERSION: ${{ steps.calver.outputs.version }}
         run: |
           set -euo pipefail
           {
             echo "images<<__EOF__"
-            jq -r --arg ci "$CI_TAG" --arg v "$VERSION" \
-              '.images[] | "\(.source):\($ci) \(.source):\($v)"' "$CONFIG"
+            while read -r ref; do
+              [[ -n "$ref" ]] && echo "${ref} ${ref%@*}:${VERSION}"
+            done <<< "$RESOLVED"
             echo "__EOF__"
           } >> "$GITHUB_OUTPUT"
 
-      # Same registry on both sides: this is a retag of the tested digest.
+      # Same registry on both sides: this is a retag of the verified digest.
       - name: Tag the tested images with the release version
         id: copy
         uses: ronford-digital/.github/actions/copy-image@v1
@@ -150,28 +207,6 @@ jobs:
           source-password: ${{ secrets.registry-token || github.token }}
           destination-username: ${{ secrets.registry-username || github.actor }}
           destination-password: ${{ secrets.registry-token || github.token }}
-
-      - name: Check images were built from this commit
-        env:
-          DIGESTS: ${{ steps.copy.outputs.digests }}
-          COMMIT: ${{ steps.config.outputs.commit }}
-          REG_USER: ${{ secrets.registry-username || github.actor }}
-          REG_PASS: ${{ secrets.registry-token || github.token }}
-        run: |
-          set -euo pipefail
-          echo "$REG_PASS" | skopeo login -u "$REG_USER" --password-stdin ghcr.io >/dev/null
-          for ref in $(jq -r 'keys[]' <<< "$DIGESTS"); do
-            rev=$(skopeo inspect --config "docker://$ref" \
-              | jq -r '.config.Labels["org.opencontainers.image.revision"] // empty')
-            if [[ -z "$rev" ]]; then
-              # Images built before the OCI-label change carry no revision label;
-              # the CI tag (which embeds the sha) is the only link we have.
-              echo "::warning::$ref has no org.opencontainers.image.revision label (built before the labelling change)"
-            elif [[ "$rev" != "$COMMIT" ]]; then
-              echo "::error::$ref was built from $rev, not $COMMIT"
-              exit 1
-            fi
-          done
 
       - name: Create GitHub Release
         env:

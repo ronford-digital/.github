@@ -62,11 +62,28 @@ runs:
 
         # Digest of the top-level manifest (the index, when the image carries
         # SBOM/provenance attestations) exactly as the registry serves it --
-        # the identity the cluster pulls.
+        # the identity the cluster pulls. Hash the stream directly: capturing it
+        # in a variable first would strip trailing newlines and change the hash.
         digest_of() { # <authfile> <ref>
-          local raw
-          raw=$(skopeo inspect --authfile "$1" --raw "docker://$2") || return 1
-          echo "sha256:$(printf '%s' "$raw" | sha256sum | cut -d' ' -f1)"
+          local sum
+          sum=$(skopeo inspect --authfile "$1" --raw "docker://$2" | sha256sum) || return 1
+          echo "sha256:${sum%% *}"
+        }
+
+        # Destination digest, or empty if the registry says definitively that
+        # the tag (or the whole repository) does not exist. Any other failure
+        # (auth, network, 5xx) is fatal: treating it as "absent" could let the
+        # copy overwrite an immutable version tag.
+        dst_digest() { # <authfile> <ref>
+          local out
+          if out=$(digest_of "$1" "$2" 2>"$auth_dir/inspect.err"); then
+            echo "$out"
+          elif grep -qE 'manifest unknown|name unknown' "$auth_dir/inspect.err"; then
+            echo ""
+          else
+            cat "$auth_dir/inspect.err" >&2
+            return 1
+          fi
         }
 
         repo_of() { # strip :tag / @digest, keeping any registry :port
@@ -88,13 +105,18 @@ runs:
           login_once "$dst_auth" "$DST_USER" "$DST_PASS" "$DST"
 
           if ! SRC_DIGEST=$(digest_of "$src_auth" "$SRC"); then
-            echo "::error::Source image not found: $SRC"
+            echo "::error::Could not inspect source image: $SRC"
             failed=1
             continue
           fi
 
           # Version tags are immutable by policy: never move an existing one.
-          if DST_EXISTING=$(digest_of "$dst_auth" "$DST" 2>/dev/null); then
+          if ! DST_EXISTING=$(dst_digest "$dst_auth" "$DST"); then
+            echo "::error::Could not check whether $DST already exists; refusing to copy over it."
+            failed=1
+            continue
+          fi
+          if [[ -n "$DST_EXISTING" ]]; then
             if [[ "$DST_EXISTING" != "$SRC_DIGEST" ]]; then
               echo "::error::$DST already exists with a DIFFERENT digest ($DST_EXISTING, source is $SRC_DIGEST). Version tags are immutable -- cut a new version instead."
               failed=1
