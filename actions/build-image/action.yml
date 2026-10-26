@@ -1,0 +1,177 @@
+name: Build image
+description: >
+  Build and push ONE container image with the standard OCI label set, an SBOM
+  attestation and SLSA provenance (mode=min). Replaces raw `docker build` /
+  `docker tag` / `docker push`. Never pushes a mutable tag.
+
+inputs:
+  image:
+    description: Full image name without tag, e.g. ghcr.io/ronford-digital/knpdts-cbs-ftip-core-api.
+    required: true
+  tags:
+    description: >
+      Newline-separated tag VALUES (not full refs). Must not contain `latest`.
+      Runs of characters outside [a-zA-Z0-9._-] become `-`.
+    required: true
+  file:
+    description: Path to the Dockerfile.
+    required: true
+  context:
+    description: Build context.
+    required: false
+    default: .
+  build-args:
+    description: Newline-separated KEY=VALUE build args.
+    required: false
+    default: ""
+  train:
+    description: Release train this image belongs to (com.ronford.release.train), e.g. momo.
+    required: true
+  channel:
+    description: Release channel (com.ronford.release.channel) -- edge for every CI build.
+    required: false
+    default: edge
+  title:
+    description: org.opencontainers.image.title. Defaults to the last path segment of `image`.
+    required: false
+    default: ""
+  description:
+    description: org.opencontainers.image.description.
+    required: false
+    default: ""
+  registry:
+    description: Registry host to log in to.
+    required: false
+    default: ghcr.io
+  registry-username:
+    description: Registry username.
+    required: true
+  registry-password:
+    description: Registry password / token.
+    required: true
+
+outputs:
+  digest:
+    description: Digest of the pushed image (index) -- the image's true identity.
+    value: ${{ steps.build.outputs.digest }}
+  ref:
+    description: First tag as a full reference, convenient for scanners.
+    value: ${{ steps.prepare.outputs.ref }}
+
+runs:
+  using: composite
+  steps:
+    - name: Prepare tags and labels
+      id: prepare
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        TAGS: ${{ inputs.tags }}
+        TITLE: ${{ inputs.title }}
+      run: |
+        set -euo pipefail
+        meta_tags=""
+        first=""
+        while IFS= read -r t; do
+          t="$(echo "$t" | xargs)"
+          [[ -z "$t" ]] && continue
+          # Same sanitisation metadata-action applies before pushing (e.g.
+          # feature/x-deadbeef -> feature-x-deadbeef), so `ref` matches what
+          # is actually pushed. cut-release.yml normalises CI tags identically.
+          t="$(sed -E 's/[^a-zA-Z0-9._-]+/-/g' <<< "$t")"
+          # RULE: no mutable tags. A manifest pinned to one cannot be rolled back.
+          if [[ "$t" == "latest" || "$t" == *-latest ]]; then
+            echo "::error::Refusing to push mutable tag '$t' (see 06 Deployment Standards / 01 Image Tagging and Versioning)"
+            exit 1
+          fi
+          [[ -z "$first" ]] && first="$t"
+          meta_tags+="type=raw,value=${t}"$'\n'
+        done <<< "$TAGS"
+        if [[ -z "$first" ]]; then
+          echo "::error::No tags given"
+          exit 1
+        fi
+        {
+          echo "tags<<__EOF__"
+          printf '%s' "$meta_tags"
+          echo "__EOF__"
+        } >> "$GITHUB_OUTPUT"
+        echo "ref=${IMAGE}:${first}" >> "$GITHUB_OUTPUT"
+        echo "title=${TITLE:-${IMAGE##*/}}" >> "$GITHUB_OUTPUT"
+        # Cache scope per image, so a matrix of images doesn't thrash one cache.
+        echo "cache-scope=$(echo "${IMAGE#*/}" | tr '/:' '--')" >> "$GITHUB_OUTPUT"
+
+    - name: Generate OCI metadata
+      id: meta
+      uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+      with:
+        images: ${{ inputs.image }}
+        tags: ${{ steps.prepare.outputs.tags }}
+        # created, revision (full sha), source, url, version, licenses are filled
+        # from the git context by metadata-action -- generated, so they can't drift.
+        labels: |
+          org.opencontainers.image.title=${{ steps.prepare.outputs.title }}
+          org.opencontainers.image.description=${{ inputs.description }}
+          org.opencontainers.image.vendor=Ronford Digital
+          com.ronford.release.train=${{ inputs.train }}
+          com.ronford.release.channel=${{ inputs.channel }}
+          com.ronford.build.run-id=${{ github.run_id }}
+          com.ronford.build.run-url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          com.ronford.source.branch=${{ github.ref_name }}
+        annotations: |
+          org.opencontainers.image.title=${{ steps.prepare.outputs.title }}
+          org.opencontainers.image.vendor=Ronford Digital
+          com.ronford.release.train=${{ inputs.train }}
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+    - name: Log in to registry
+      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+      with:
+        registry: ${{ inputs.registry }}
+        username: ${{ inputs.registry-username }}
+        password: ${{ inputs.registry-password }}
+
+    - name: Build and push
+      id: build
+      uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+      env:
+        # The build summary and the build record artifact both list the build
+        # inputs, including build args. Our own summary step below replaces them.
+        DOCKER_BUILD_SUMMARY: "false"
+        DOCKER_BUILD_RECORD_UPLOAD: "false"
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ inputs.file }}
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        annotations: ${{ steps.meta.outputs.annotations }}
+        build-args: ${{ inputs.build-args }}
+        # mode=min, NOT max: max mode writes build-arg VALUES into the attestation,
+        # and our Dockerfiles receive the NuGet feed credentials as build args.
+        # That attestation is pushed to the registry and later copied to the
+        # client's registry. Move those credentials to `secrets:` mounts before
+        # ever raising this to max.
+        provenance: mode=min
+        sbom: true
+        cache-from: type=gha,scope=${{ steps.prepare.outputs.cache-scope }}
+        cache-to: type=gha,mode=max,scope=${{ steps.prepare.outputs.cache-scope }}
+
+    - name: Summary
+      shell: bash
+      env:
+        REF: ${{ steps.prepare.outputs.ref }}
+        DIGEST: ${{ steps.build.outputs.digest }}
+      run: |
+        echo "::notice::Pushed ${REF}@${DIGEST}"
+        {
+          echo "### 📦 \`${REF}\`"
+          echo ""
+          echo "| Field | Value |"
+          echo "|---|---|"
+          echo "| Digest | \`${DIGEST}\` |"
+          echo "| Revision | \`${GITHUB_SHA}\` |"
+          echo "| Train / channel | \`${{ inputs.train }}\` / \`${{ inputs.channel }}\` |"
+        } >> "$GITHUB_STEP_SUMMARY"

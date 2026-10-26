@@ -1,0 +1,149 @@
+# Regression test for "prod was rebuilt instead of promoted" (standard, Part 9
+# Phase 6): for every CalVer tag of every image of the train in the client
+# registry, assert digest(client:V) == digest(ronford-digital:V). Read-only.
+name: Digest parity (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      prod-registry:
+        description: Client registry prefix.
+        type: string
+        default: ghcr.io/knpdt-sacco/e-ziada-artifacts
+      config:
+        description: Path to the release train config in the caller repo.
+        type: string
+        default: .github/release-train.json
+      legacy-before:
+        description: >
+          Optional CalVer version, e.g. 2026.10.24. Client versions OLDER than
+          this may have no matching ronford-digital tag (released before the
+          standard) and are reported, not failed. Empty: every version must match.
+        type: string
+        default: ""
+    secrets:
+      prod-username:
+        description: User that can read the client registry.
+        required: true
+      prod-password:
+        description: Token that can read the client registry.
+        required: true
+      registry-username:
+        description: Username for ghcr.io/ronford-digital (default github.actor).
+        required: false
+      registry-token:
+        description: Token with packages read on the train's images (default GITHUB_TOKEN).
+        required: false
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Compare digests
+        env:
+          CONFIG: ${{ inputs.config }}
+          PROD: ${{ inputs.prod-registry }}
+          LEGACY_BEFORE: ${{ inputs.legacy-before }}
+          SRC_USER: ${{ secrets.registry-username || github.actor }}
+          SRC_PASS: ${{ secrets.registry-token || github.token }}
+          DST_USER: ${{ secrets.prod-username }}
+          DST_PASS: ${{ secrets.prod-password }}
+        run: |
+          set -euo pipefail
+          calver='^[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}(\.[0-9]+)?$'
+          if [[ -n "$LEGACY_BEFORE" && ! "$LEGACY_BEFORE" =~ $calver ]]; then
+            echo "::error::legacy-before must be a CalVer version, got '$LEGACY_BEFORE'"
+            exit 1
+          fi
+
+          # Validate the config in the foreground so a missing or malformed file
+          # fails the job instead of leaving the loop below empty.
+          [[ -f "$CONFIG" ]] || { echo "::error::$CONFIG not found"; exit 1; }
+          if ! jq -e '(.images | type == "array" and length > 0)
+              and (.images | all((.name | type == "string" and length > 0)
+                             and (.source | type == "string" and length > 0)))' "$CONFIG" >/dev/null; then
+            echo "::error::$CONFIG must have a non-empty images[] of {name, source}"
+            exit 1
+          fi
+
+          auth_dir="$(mktemp -d)"; trap 'rm -rf "$auth_dir"' EXIT
+          jq -r '.images[] | "\(.name) \(.source)"' "$CONFIG" > "$auth_dir/images.txt"
+          echo "$SRC_PASS" | skopeo login --authfile "$auth_dir/src.json" -u "$SRC_USER" --password-stdin ghcr.io >/dev/null
+          echo "$DST_PASS" | skopeo login --authfile "$auth_dir/dst.json" -u "$DST_USER" --password-stdin "${PROD%%/*}" >/dev/null
+
+          # Hash the raw manifest stream directly: capturing it in a variable
+          # first would strip trailing newlines and change the hash.
+          digest_of() { local sum; sum=$(skopeo inspect --authfile "$1" --raw "docker://$2" | sha256sum) || return 1; echo "sha256:${sum%% *}"; }
+          # True if the last skopeo error was a definitive "does not exist".
+          not_found() { grep -qE 'manifest unknown|name unknown' "$auth_dir/err"; }
+          # True if version $1 sorts strictly before $LEGACY_BEFORE.
+          is_legacy() { [[ -n "$LEGACY_BEFORE" && "$1" != "$LEGACY_BEFORE" && "$(printf '%s\n' "$1" "$LEGACY_BEFORE" | sort -V | head -1)" == "$1" ]]; }
+
+          echo "| Image | Version | Result |" > report.md
+          echo "|---|---|---|" >> report.md
+          mismatches=0
+          errors=0
+          checked=0
+          while read -r NAME SOURCE <&3; do
+            DST_REPO="${PROD}/${NAME}"
+            if ! listing=$(skopeo list-tags --authfile "$auth_dir/dst.json" "docker://${DST_REPO}" 2>"$auth_dir/err"); then
+              if not_found; then
+                echo "| \`${NAME}\` | - | ⚪ not in client registry yet |" >> report.md
+                continue
+              fi
+              cat "$auth_dir/err" >&2
+              echo "::error::Could not list tags of ${DST_REPO}"
+              echo "| \`${NAME}\` | - | ❌ could not list tags |" >> report.md
+              errors=$((errors + 1))
+              continue
+            fi
+            # jq errors fail the job; grep exiting 1 only means no CalVer tags.
+            all_tags=$(jq -r '.Tags[]' <<< "$listing")
+            tags=$(grep -E "$calver" <<< "$all_tags" || [[ $? -eq 1 ]])
+
+            for V in $tags; do
+              if ! D=$(digest_of "$auth_dir/dst.json" "${DST_REPO}:${V}" 2>"$auth_dir/err"); then
+                cat "$auth_dir/err" >&2
+                echo "::error::Could not inspect ${DST_REPO}:${V}"
+                echo "| \`${NAME}\` | ${V} | ❌ could not inspect client image |" >> report.md
+                errors=$((errors + 1))
+                continue
+              fi
+              if ! S=$(digest_of "$auth_dir/src.json" "${SOURCE}:${V}" 2>"$auth_dir/err"); then
+                if not_found && is_legacy "$V"; then
+                  echo "| \`${NAME}\` | ${V} | ⚠️ no source tag (older than ${LEGACY_BEFORE}) |" >> report.md
+                  continue
+                fi
+                cat "$auth_dir/err" >&2
+                echo "::error::Could not inspect ${SOURCE}:${V}"
+                echo "| \`${NAME}\` | ${V} | ❌ could not inspect source image |" >> report.md
+                errors=$((errors + 1))
+                continue
+              fi
+              checked=$((checked + 1))
+              if [[ "$S" == "$D" ]]; then
+                echo "| \`${NAME}\` | ${V} | ✅ identical |" >> report.md
+              else
+                echo "::error::${NAME}:${V} differs: ronford-digital ${S} vs client ${D}"
+                echo "| \`${NAME}\` | ${V} | ❌ MISMATCH |" >> report.md
+                mismatches=$((mismatches + 1))
+              fi
+            done
+          done 3< "$auth_dir/images.txt"
+
+          {
+            echo "## Digest parity"
+            echo ""
+            echo "${checked} compared, ${mismatches} mismatched, ${errors} could not be checked."
+            echo ""
+            cat report.md
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $(( mismatches + errors > 0 ))
