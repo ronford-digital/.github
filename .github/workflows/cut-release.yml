@@ -128,7 +128,15 @@ jobs:
             echo "ci-tag=$CI_TAG"
           } >> "$GITHUB_OUTPUT"
 
-      # Resolve every CI image to a digest and check its provenance BEFORE any
+      - name: Compute version
+        id: calver
+        uses: ronford-digital/.github/actions/next-calver@v1
+        with:
+          tag-prefix: ${{ steps.config.outputs.tag-prefix }}
+          legacy-prefixes: ${{ steps.config.outputs.legacy-prefixes }}
+          prerelease: ${{ steps.config.outputs.prerelease }}
+
+      # Resolve every image to a digest and check its provenance BEFORE any
       # version tag is written. Version tags are immutable, so a failure after
       # tagging would leave orphan tags that block a corrected retry.
       - name: Resolve and verify the tested images
@@ -137,50 +145,88 @@ jobs:
           CONFIG: ${{ inputs.config }}
           CI_TAG: ${{ steps.config.outputs.ci-tag }}
           COMMIT: ${{ steps.config.outputs.commit }}
+          PREVIOUS_TAG: ${{ steps.calver.outputs.previous-tag }}
           REG_USER: ${{ secrets.registry-username || github.actor }}
           REG_PASS: ${{ secrets.registry-token || github.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           echo "$REG_PASS" | skopeo login -u "$REG_USER" --password-stdin ghcr.io >/dev/null
           sources=$(jq -r '.images[].source' "$CONFIG")
           resolved=""
+          selection='[]'
           failed=0
+
+          previous_release_json=""
+          if [[ -n "$PREVIOUS_TAG" ]]; then
+            work_dir="$RUNNER_TEMP/cut-release"
+            mkdir -p "$work_dir"
+            if gh release download "$PREVIOUS_TAG" --pattern release.json --dir "$work_dir" --clobber >/dev/null 2>&1; then
+              previous_release_json="$work_dir/release.json"
+            else
+              echo "::warning::Could not download release.json from ${PREVIOUS_TAG}; fallback to previous release digests is disabled."
+            fi
+          fi
+
           for SOURCE in $sources; do
+            mode="ci-tag"
+            inspect_error_file=$(mktemp)
             # Hash the raw manifest stream (the index the cluster pulls).
-            if ! sum=$(skopeo inspect --raw "docker://${SOURCE}:${CI_TAG}" | sha256sum); then
-              echo "::error::Could not inspect ${SOURCE}:${CI_TAG}"
-              failed=1
-              continue
+            if raw_manifest=$(skopeo inspect --raw "docker://${SOURCE}:${CI_TAG}" 2>"$inspect_error_file"); then
+              sum=$(printf '%s' "$raw_manifest" | sha256sum)
+              ref="${SOURCE}@sha256:${sum%% *}"
+              rev=$(skopeo inspect --config "docker://$ref" \
+                | jq -r '.config.Labels["org.opencontainers.image.revision"] // empty')
+              if [[ -z "$rev" ]]; then
+                # Images built before the OCI-label change carry no revision label;
+                # the CI tag (which embeds the sha) is the only link we have.
+                echo "::warning::${SOURCE}:${CI_TAG} has no org.opencontainers.image.revision label (built before the labelling change)"
+              elif [[ "$rev" != "$COMMIT" ]]; then
+                echo "::error::${SOURCE}:${CI_TAG} was built from $rev, not $COMMIT"
+                failed=1
+                rm -f "$inspect_error_file"
+                continue
+              fi
+            else
+              inspect_error=$(cat "$inspect_error_file")
+              if [[ -n "$previous_release_json" ]] && grep -qiE 'manifest unknown|not found|name unknown' <<< "$inspect_error"; then
+                digest=$(jq -r --arg source "$SOURCE" '.images[] | select(.image == $source) | .digest' "$previous_release_json" | head -n1)
+                if [[ -z "$digest" || "$digest" == "null" ]]; then
+                  echo "::error::${SOURCE}:${CI_TAG} does not exist and no digest for ${SOURCE} was found in ${PREVIOUS_TAG} release.json"
+                  failed=1
+                  rm -f "$inspect_error_file"
+                  continue
+                fi
+                ref="${SOURCE}@${digest}"
+                if ! skopeo inspect --config "docker://$ref" >/dev/null 2>&1; then
+                  echo "::error::Fallback digest ${ref} from ${PREVIOUS_TAG} could not be inspected"
+                  failed=1
+                  rm -f "$inspect_error_file"
+                  continue
+                fi
+                mode="previous-release"
+                echo "::notice::Reusing ${ref} from ${PREVIOUS_TAG}"
+              else
+                echo "::error::Could not inspect ${SOURCE}:${CI_TAG}: ${inspect_error}"
+                failed=1
+                rm -f "$inspect_error_file"
+                continue
+              fi
             fi
-            ref="${SOURCE}@sha256:${sum%% *}"
-            rev=$(skopeo inspect --config "docker://$ref" \
-              | jq -r '.config.Labels["org.opencontainers.image.revision"] // empty')
-            if [[ -z "$rev" ]]; then
-              # Images built before the OCI-label change carry no revision label;
-              # the CI tag (which embeds the sha) is the only link we have.
-              echo "::warning::${SOURCE}:${CI_TAG} has no org.opencontainers.image.revision label (built before the labelling change)"
-            elif [[ "$rev" != "$COMMIT" ]]; then
-              echo "::error::${SOURCE}:${CI_TAG} was built from $rev, not $COMMIT"
-              failed=1
-              continue
-            fi
-            echo "resolved ${SOURCE}:${CI_TAG} -> $ref"
+            rm -f "$inspect_error_file"
+            echo "resolved ${SOURCE} -> $ref (${mode})"
             resolved+="${ref}"$'\n'
+            selection=$(jq -c --arg image "$SOURCE" --arg mode "$mode" --arg ref "$ref" '
+              . + [{image: $image, selection: $mode, source_ref: $ref}]
+            ' <<< "$selection")
           done
           (( failed == 0 )) || exit 1
           {
             echo "images<<__EOF__"
             printf '%s' "$resolved"
             echo "__EOF__"
+            echo "selection=$selection"
           } >> "$GITHUB_OUTPUT"
-
-      - name: Compute version
-        id: calver
-        uses: ronford-digital/.github/actions/next-calver@v1
-        with:
-          tag-prefix: ${{ steps.config.outputs.tag-prefix }}
-          legacy-prefixes: ${{ steps.config.outputs.legacy-prefixes }}
-          prerelease: ${{ steps.config.outputs.prerelease }}
 
       - name: List retags
         id: pairs
@@ -219,28 +265,32 @@ jobs:
           TRAIN: ${{ steps.config.outputs.train }}
           CHANNEL: ${{ inputs.channel }}
           DIGESTS: ${{ steps.copy.outputs.digests }}
+          SELECTION: ${{ steps.resolve.outputs.selection }}
         run: |
           set -euo pipefail
           jq -n \
             --arg train "$TRAIN" --arg version "$VERSION" --arg channel "$CHANNEL" \
             --arg repo "$GITHUB_REPOSITORY" --arg revision "$COMMIT" --arg git_tag "$TAG" \
             --arg ci_tag "$CI_TAG" --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            --arg released_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson digests "$DIGESTS" \
+            --arg released_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson digests "$DIGESTS" --argjson selection "$SELECTION" \
             '{train: $train, version: $version, channel: $channel, released_at: $released_at,
               source: {repo: $repo, revision: $revision, git_tag: $git_tag, ci_tag: $ci_tag},
               build_run: $run,
+              selection: $selection,
               images: ($digests | to_entries | map({image: (.key | sub(":[^:/]+$"; "")), tag: $version, digest: .value}))}' \
             > release.json
 
           {
             echo "## Images"
             echo ""
-            echo "Built once by CI from \`${COMMIT}\` (CI tag \`${CI_TAG}\`), tested in UAT, then"
-            echo "tagged \`${VERSION}\` **without rebuilding**. Promote with the *Promote to prod* workflow."
+            echo "Images with CI tag \`${CI_TAG}\` were taken from this commit; services with no CI tag reuse"
+            echo "their digest from \`${PREVIOUS}\`. All were tagged \`${VERSION}\` **without rebuilding**."
             echo ""
-            echo "| Image | Digest |"
-            echo "|---|---|"
-            jq -r '.images[] | "| `\(.image):\(.tag)` | `\(.digest)` |"' release.json
+            echo "| Image | Digest | Source |"
+            echo "|---|---|---|"
+            jq -r '.images[] as $image
+              | (.selection[] | select(.image == $image.image) | .selection) as $source
+              | "| `\($image.image):\($image.tag)` | `\($image.digest)` | `\($source // "ci-tag")` |"' release.json
             echo ""
           } > notes.md
 
