@@ -162,7 +162,12 @@ jobs:
             work_dir="$RUNNER_TEMP/cut-release"
             mkdir -p "$work_dir"
             if gh release download "$PREVIOUS_TAG" --pattern release.json --dir "$work_dir" --clobber >/dev/null 2>&1; then
-              previous_release_json="$work_dir/release.json"
+              previous_revision=$(jq -r '.source.revision // empty' "$work_dir/release.json")
+              if [[ "$previous_revision" =~ ^[0-9a-f]{40}$ ]] && git merge-base --is-ancestor "$previous_revision" "$COMMIT"; then
+                previous_release_json="$work_dir/release.json"
+              else
+                echo "::warning::Release ${PREVIOUS_TAG} has no compatible ancestor revision for ${COMMIT}; fallback to previous release digests is disabled."
+              fi
             else
               echo "::warning::Could not download release.json from ${PREVIOUS_TAG}; fallback to previous release digests is disabled."
             fi
@@ -172,8 +177,7 @@ jobs:
             mode="ci-tag"
             inspect_error_file=$(mktemp)
             # Hash the raw manifest stream (the index the cluster pulls).
-            if raw_manifest=$(skopeo inspect --raw "docker://${SOURCE}:${CI_TAG}" 2>"$inspect_error_file"); then
-              sum=$(printf '%s' "$raw_manifest" | sha256sum)
+            if sum=$(skopeo inspect --raw "docker://${SOURCE}:${CI_TAG}" 2>"$inspect_error_file" | sha256sum); then
               ref="${SOURCE}@sha256:${sum%% *}"
               rev=$(skopeo inspect --config "docker://$ref" \
                 | jq -r '.config.Labels["org.opencontainers.image.revision"] // empty')
