@@ -226,10 +226,18 @@ jobs:
                 # the CI tag (which embeds the sha) is the only link we have.
                 echo "::warning::${SOURCE}:${CI_TAG} has no org.opencontainers.image.revision label (built before the labelling change)"
               elif [[ "$rev" != "$COMMIT" ]]; then
-                echo "::error::${SOURCE}:${CI_TAG} was built from $rev, not $COMMIT"
-                failed=1
-                rm -f "$inspect_error_file"
-                continue
+                # Selective CI builds give an unchanged service's previous image this commit's
+                # tag (same digest), so its label names the older commit it was built from.
+                # Accept that only for an ancestor of the release commit.
+                if [[ "$rev" =~ ^[0-9a-f]{40}$ ]] && git merge-base --is-ancestor "$rev" "$COMMIT" 2>/dev/null; then
+                  mode="retagged-ci-tag"
+                  echo "::notice::${SOURCE}:${CI_TAG} was built from ancestor $rev and tagged for $COMMIT unchanged."
+                else
+                  echo "::error::${SOURCE}:${CI_TAG} was built from $rev, which is not $COMMIT or an ancestor of it"
+                  failed=1
+                  rm -f "$inspect_error_file"
+                  continue
+                fi
               fi
             else
               inspect_error=$(cat "$inspect_error_file")
