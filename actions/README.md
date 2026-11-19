@@ -90,3 +90,14 @@ Breaking changes go to `v2`.
 - **Cosign signing and Kyverno verification (Phase 5) are not here yet.**
   Keyless signing from a private repo writes the image and repo names to the
   public Rekor transparency log. Decide on keyless vs a KMS key first.
+
+## Releasing
+
+Callers pin `@v1`, so moving `v1` is what ships a change. Do it with a PR:
+set `VERSION` to the next `MAJOR.MINOR.PATCH` alongside the change. When it
+merges into `main`, `.github/workflows/tag-release.yml` creates the fixed tag
+`v<VERSION>` and moves `v<MAJOR>` to the same commit. A PR that doesn't touch
+`VERSION` ships nothing.
+
+To roll back, open a PR that reverts the change and bumps `VERSION` again.
+The fixed tags (`v1.0.0`, `v1.1.0`, ...) record what each release was.

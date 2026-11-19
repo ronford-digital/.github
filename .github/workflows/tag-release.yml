@@ -1,0 +1,70 @@
+name: Tag release
+
+# Ships this repo to its callers. Product repos pin @v1, so moving v1 is the
+# release. A PR that changes VERSION is the only way to do it: on merge, this
+# creates the fixed tag v<VERSION> and moves v<MAJOR> to the same commit.
+# Roll back with another PR: revert the change and bump VERSION again.
+
+on:
+  push:
+    branches: [main]
+    paths: [VERSION]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tag-release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          # GitHub can refuse a GITHUB_TOKEN push when the tag move changes
+          # workflow files. If this job fails with "refusing to allow a GitHub
+          # App to create or update workflow", add a TAG_RELEASE_TOKEN secret
+          # (fine-grained token: Contents and Workflows write on this repo).
+          token: ${{ secrets.TAG_RELEASE_TOKEN || github.token }}
+
+      - name: Tag v<VERSION> and move v<MAJOR>
+        run: |
+          set -euo pipefail
+          version=$(tr -d '[:space:]' < VERSION)
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::VERSION must be MAJOR.MINOR.PATCH, got '${version}'"
+            exit 1
+          fi
+          tag="v${version}"
+          major="v${version%%.*}"
+
+          if git rev-parse -q --verify "refs/tags/${tag}" > /dev/null; then
+            echo "::error::${tag} already exists. Bump VERSION to release again."
+            exit 1
+          fi
+
+          # The first time, give what the major tag pointed at a fixed name too,
+          # so a rollback PR has something to point back to.
+          to_push=("refs/tags/${tag}")
+          if previous=$(git rev-parse -q --verify "refs/tags/${major}^{commit}") \
+             && [[ -z "$(git tag -l "${major}.*")" ]]; then
+            git tag "${major}.0.0" "$previous"
+            to_push+=("refs/tags/${major}.0.0")
+            echo "::notice::Tagged the previous ${major} (${previous}) as ${major}.0.0"
+          fi
+
+          git tag "$tag" "$GITHUB_SHA"
+          git tag -f "$major" "$GITHUB_SHA"
+          git push origin "${to_push[@]}"
+          git push --force origin "refs/tags/${major}"
+
+          {
+            echo "### Released ${tag}"
+            echo ""
+            echo "\`${major}\` and \`${tag}\` now point at \`${GITHUB_SHA}\`."
+            [[ -n "${previous:-}" ]] && echo "Previous \`${major}\`: \`${previous}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
